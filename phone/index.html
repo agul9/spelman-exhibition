@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Restore</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      text-align: center;
+      padding: 24px;
+    }
+    .row {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      margin: 24px 0;
+    }
+    .square {
+      width: 120px;
+      height: 120px;
+      background: #e8743b;
+      opacity: 0.4;              /* dim until selected */
+      border: 4px solid transparent;
+    }
+    .square.selected {
+      opacity: 1;                /* bright when selected */
+      border-color: #111;
+    }
+    button {
+      font-size: 18px;
+      padding: 12px 32px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Pick a square</h2>
+
+  <div class="row">
+    <div class="square" id="sq0"></div>
+    <div class="square" id="sq1"></div>
+  </div>
+
+  <button id="submit">Submit</button>
+
+  <script type="module">
+    // Bring in the database connection and the "write" tool.
+    import { db, ref, set } from "../shared/firebase.js";
+
+    // Remembers which square the visitor tapped.
+    // null means nothing has been picked yet.
+    let selected = null;
+
+    // Find every square on the page.
+    const allSquares = document.querySelectorAll(".square");
+
+    // For each square, listen for a tap.
+    allSquares.forEach(function (squareElement, index) {
+      squareElement.addEventListener("click", function () {
+        // First remove the highlight from every square.
+        allSquares.forEach(function (s) {
+          s.classList.remove("selected");
+        });
+        // Then highlight the one that was tapped.
+        squareElement.classList.add("selected");
+        // Remember its number (0 or 1).
+        selected = index;
+      });
+    });
+
+    // When the Submit button is pressed:
+    document.getElementById("submit").addEventListener("click", function () {
+      // Make sure a square was chosen.
+      if (selected === null) {
+        alert("Pick a square first");
+        return;
+      }
+
+      // Write to the database at the path walls/A/squares/<number>.
+      // Date.now() is the current time in milliseconds.
+      set(ref(db, "walls/A/squares/" + selected), {
+        restoredAt: Date.now()
+      });
+    });
+  </script>
+</body>
+</html>
