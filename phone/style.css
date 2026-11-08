@@ -1,0 +1,53 @@
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    font-family: system-ui, sans-serif;
+}
+
+.screen {
+  display: none;
+  min-height: 100vh;
+  padding: 24px;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.screen.active { display: flex; }
+
+button {
+    padding: 14px;
+    font-size: 1rem;
+}
+textarea {
+    width: 100%;
+    min-height: 140px;
+    font-size: 1rem;
+}
+canvas {
+    width: 100%;
+    height: auto;
+}
+
+/* from figma */
+#piece-list {
+    display: grid;
+    grid-template-columns: repeat(9, 1fr);
+    gap: 4.4px;
+    width: 100%;
+}
+.pieceBtns {
+    border: none;
+    fill: none;
+    padding: 0;
+    line-height: 0;
+}
+.pieceBtns.is-selected {
+    opacity: 50%;
+}
+.pieceBtns img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;   /* fills the button without stretching */
+  display: block;
+}

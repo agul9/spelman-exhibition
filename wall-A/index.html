@@ -2,91 +2,68 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Wall</title>
+  <title>Wall A</title>
   <style>
     body {
       margin: 0;
       background: #111;
+      height: 100vh;
       display: flex;
-      gap: 40px;
       justify-content: center;
       align-items: center;
-      height: 100vh;
     }
-    .square {
-      width: 200px;
-      height: 200px;
-      background: #e8743b;
-      opacity: 0.2;
+    #wall {
+      display: grid;
+      grid-template-columns: repeat(9, 1fr);
+      aspect-ratio: 3 / 2;          /* matches the 1620 x 1080 crop */
+      width: min(100vw, 150vh);     /* fits the screen without cropping */
+    }
+    .square img {
+      width: 100%;
+      height: 100%;
+      display: block;
     }
   </style>
 </head>
 <body>
-  <div class="square" id="sq0"></div>
-  <div class="square" id="sq1"></div>
+  <div id="wall"></div>
 
   <script type="module">
-    // Bring in the database connection and the "listen" tool.
     import { db, ref, onValue } from "../shared/firebase.js";
 
-    // How long a square takes to fade from fully bright to faded.
-    // 30 * 1000 = 30 seconds (in milliseconds).
+    const TOTAL = 54;
     const FADE_MS = 30 * 1000;
-
-    // The dimmest a square is allowed to get.
     const MIN_OPACITY = 0.2;
 
-    // A local copy of whatever is stored in the database.
-    // Starts empty until Firebase sends the first update.
-    let squares = {};
+    // build the tiles once
+    const wall = document.getElementById("wall");
+    const tiles = [];
+    for (let i = 1; i <= TOTAL; i++) {
+      const div = document.createElement("div");
+      div.className = "square";
+      div.innerHTML = `<img src="../images/wall-A-pieces/piece-${i}.png" alt="">`;
+      wall.appendChild(div);
+      tiles[i] = div;
+    }
 
-    // Watch the location walls/A/squares in the database.
-    // Firebase runs this function once right away, and again every
-    // time anything there changes.
+    let squares = {};
     onValue(ref(db, "walls/A/squares"), function (snapshot) {
-      // snapshot.val() turns the stored data into a normal JavaScript object.
-      // If nothing is stored yet, it returns null, so we use {} instead.
       squares = snapshot.val() || {};
     });
 
-    // Work out how bright square number i should be right now.
     function opacityFor(i) {
-      // Look up when this square was last restored.
       const square = squares[i];
-      let restoredAt;
-      if (square) {
-            restoredAt = square.restoredAt;
-        } else {
-            restoredAt = undefined;
-        }
-
-      // Never restored: stay faded.
-      if (!restoredAt) {
-        return MIN_OPACITY;
-      }
-
-      // How many milliseconds ago was it restored?
-      const age = Date.now() - restoredAt;
-
-      // age = 0 gives 1 (fully bright).
-      // age = FADE_MS gives 0 (fully faded).
-      const brightness = 1 - age / FADE_MS;
-
-      // Never go below the minimum.
-      return Math.max(MIN_OPACITY, brightness);
+      if (!square || !square.restoredAt) return MIN_OPACITY;
+      const age = Date.now() - square.restoredAt;
+      return Math.max(MIN_OPACITY, 1 - age / FADE_MS);
     }
 
-    // Update the squares on screen, then do it again next frame.
     function draw() {
-      for (let i = 0; i < 2; i++) {
-        const element = document.getElementById("sq" + i);
-        element.style.opacity = opacityFor(i);
+      for (let i = 1; i <= TOTAL; i++) {
+        tiles[i].style.opacity = opacityFor(i);
       }
-      // Ask the browser to call draw() again before the next repaint.
       requestAnimationFrame(draw);
     }
-
-    // Start the loop.
     draw();
   </script>
 </body>

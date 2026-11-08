@@ -9,7 +9,7 @@ const firebaseConfig = {
   messagingSenderId: "417107696491",
   appId: "1:417107696491:web:0952630073e1e1a13dca2e",
   measurementId: "G-1KFSEB36RC",
-  URL: "https://spelman-exhibition-default-rtdb.firebaseio.com/"
+  databaseURL: "https://spelman-exhibition-default-rtdb.firebaseio.com/"
 };
 
 const app = initializeApp(firebaseConfig);
