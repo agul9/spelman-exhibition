@@ -1,7 +1,13 @@
 import { db, ref, set, onValue} from "../shared/firebase.js";
+import { damageForSquare, MAX_DAMAGE } from "../shared/wall-settings.js";
 
-const FADE_MS = 30 * 1000;      // match this to whatever we do in wall-A
-const MIN_OPACITY = 0.2;
+const MIN_DAMAGE_TO_RESTORE = 0.05;   // a square becomes tappable once the wall has chipped this much
+const DIM_OPACITY = 0.2;   // how faded a locked tile looks (0 = invisible, 1 = fully bright)
+
+let startedAt = null;
+onValue(ref(db, "walls/A/startedAt"), function (snapshot) {
+  startedAt = snapshot.val();
+});
 
 // picece = piece that the user picks
 // reflection = user's reflection they enter
@@ -74,26 +80,14 @@ onValue(ref(db, "walls/A/squares"), function (snapshot) {
 });
 
 function updatePieces() {
+  if (startedAt === null) return;
   document.querySelectorAll(".pieceBtns").forEach(function (btn) {
-    const n = btn.dataset.piece;
-    const square = squares[n];
-    const restoredAt = square ? square.restoredAt : undefined;
+    const damage = damageForSquare(squares, startedAt, btn.dataset.piece);
+    const tappable = damage >= MIN_DAMAGE_TO_RESTORE;
 
-    // same brightness calculation as the wall
-    let wallBrightness = MIN_OPACITY;
-    let isRestored = false;
-    if (restoredAt) {
-      const age = Date.now() - restoredAt;
-      wallBrightness = Math.max(MIN_OPACITY, 1 - age / FADE_MS);
-      isRestored = age < FADE_MS;
-    }
-
-    // flip it: bright on the wall = dim on the phone
-    const phoneOpacity = 1 + MIN_OPACITY - wallBrightness;
-
-    btn.querySelector("img").style.opacity = phoneOpacity;
-    btn.disabled = isRestored;
-    if (isRestored) btn.classList.remove("is-selected");
+    btn.querySelector("img").style.opacity = tappable ? 1 : DIM_OPACITY;
+    btn.disabled = !tappable;
+    if (!tappable) btn.classList.remove("is-selected");
   });
 }
 

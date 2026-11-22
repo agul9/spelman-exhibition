@@ -13,58 +13,330 @@
       align-items: center;
     }
     #wall {
-      display: grid;
-      grid-template-columns: repeat(9, 1fr);
+      display: block;
       aspect-ratio: 3 / 2;          /* matches the 1620 x 1080 crop */
       width: min(100vw, 150vh);     /* fits the screen without cropping */
-    }
-    .square img {
-      width: 100%;
-      height: 100%;
-      display: block;
+      background: #111;
     }
   </style>
 </head>
 <body>
-  <div id="wall"></div>
+  <canvas id="wall" width="1620" height="1080"></canvas>
 
   <script type="module">
-    import { db, ref, onValue } from "../shared/firebase.js";
+    import { db, ref, set, onValue } from "../shared/firebase.js";
+    import { damageForSquare } from "../shared/wall-settings.js";
 
-    const TOTAL = 54;
-    const FADE_MS = 30 * 1000;
-    const MIN_OPACITY = 0.2;
+    // ---------- Settings ----------
+    const COLS = 9;
+    const ROWS = 6;
+    const TOTAL = COLS * ROWS;
+    const CELL = 180;
+    const WIDTH = COLS * CELL;
+    const HEIGHT = ROWS * CELL;
 
-    // build the tiles once
+    const EDGE_BAND = 0.03;               // softness of each chip's edge; bigger = pixels fade out instead of popping
+
+    // Falling flakes (little bits of paint that drop off as the wall chips)
+    const FLAKE_CHANCE = 0.001;           // chance that a newly chipped pixel throws off a flake (0 = none)
+    const FLAKE_SIZE = [4, 16];           // smallest and biggest flake, in pixels
+    const GRAVITY = 100;                  // how fast flakes fall; lower = floatier
+    const MAX_FLAKES = 400;               // cap, so the wall never gets overloaded
+    const CHIP_COLOR = [201, 196, 186];   // flat color for chipped pixels, as [red, green, blue]
+    const REDRAW_MS = 100;                // redraw 10 times a second; erosion is slow, so no need for 60
+
+    const NOISE_SCALE = 40;               // bigger = larger blotches
+    const OCTAVES = 4;                    // more = more detail
+    const DEBUG_NOISE = false;            // true = show the noise map instead of the painting
+    const DEBUG_HUD = true;               // true = small readout in the corner (set to false for the show)
+
+    // ---------- Canvas setup ----------
     const wall = document.getElementById("wall");
-    const tiles = [];
-    for (let i = 1; i <= TOTAL; i++) {
-      const div = document.createElement("div");
-      div.className = "square";
-      div.innerHTML = `<img src="../images/wall-A-pieces/piece-${i}.png" alt="">`;
-      wall.appendChild(div);
-      tiles[i] = div;
+    const ctx = wall.getContext("2d");
+
+    // Intact painting, stitched together from the 54 pieces.
+    const intact = document.createElement("canvas");
+    intact.width = WIDTH;
+    intact.height = HEIGHT;
+    const intactCtx = intact.getContext("2d");
+
+    function loadImage(src) {
+      return new Promise(function (resolve, reject) {
+        const img = new Image();
+        img.onload = function () { resolve(img); };
+        img.onerror = function () { reject(new Error("Could not load " + src)); };
+        img.src = src;
+      });
     }
 
+    const pieces = await Promise.all(
+      Array.from({ length: TOTAL }, function (_, n) {
+        return loadImage("../images/wall-A-pieces/piece-" + (n + 1) + ".png");
+      })
+    );
+
+    for (let i = 0; i < TOTAL; i++) {
+      const col = i % COLS;
+      const row = Math.floor(i / COLS);
+      intactCtx.drawImage(pieces[i], col * CELL, row * CELL, CELL, CELL);
+    }
+
+    // The painting's pixels as a list of numbers: 4 per pixel (red, green, blue, alpha).
+    const intactPixels = intactCtx.getImageData(0, 0, WIDTH, HEIGHT).data;
+
+    // The blank picture we fill in on every redraw.
+    const output = ctx.createImageData(WIDTH, HEIGHT);
+    const out = output.data;
+
+    // The wall itself is drawn here a few times a second. Every animation frame we copy it
+    // onto the screen and draw the falling flakes on top, so flakes move smoothly.
+    const base = document.createElement("canvas");
+    base.width = WIDTH;
+    base.height = HEIGHT;
+    const baseCtx = base.getContext("2d");
+
+    const fallen = new Uint8Array(WIDTH * HEIGHT);   // 1 = this pixel has already chipped (so it only throws a flake once)
+    const flakes = [];                               // the flakes currently falling
+    const lastDamage = new Array(TOTAL + 1).fill(-1); // damage we last drew for each square, so unchanged squares can be skipped
+
+    // ---------- Firebase ----------
     let squares = {};
     onValue(ref(db, "walls/A/squares"), function (snapshot) {
       squares = snapshot.val() || {};
     });
 
-    function opacityFor(i) {
-      const square = squares[i];
-      if (!square || !square.restoredAt) return MIN_OPACITY;
-      const age = Date.now() - square.restoredAt;
-      return Math.max(MIN_OPACITY, 1 - age / FADE_MS);
+    // When the exhibition started: right now, every time this page loads, so the wall
+    // always starts clean. (Restores from before this moment are ignored.)
+    let startedAt = Date.now();
+    set(ref(db, "walls/A/startedAt"), startedAt);
+
+    // Press R on the wall page to restart: everything goes back to intact and starts
+    // chipping from now. (Click the page first so it can hear the key.)
+    window.addEventListener("keydown", function (e) {
+      if (e.key === "r" || e.key === "R") {
+        startedAt = Date.now();
+        set(ref(db, "walls/A/startedAt"), startedAt);
+        set(ref(db, "walls/A/squares"), null);   // also clear everyone's restores
+      }
+    });
+
+    // ---------- Noise map ----------
+    // Eases the blend so it doesn't look like a grid of straight ramps.
+    function smooth(t) {
+      return t * t * (3 - 2 * t);
     }
 
-    function draw() {
-      for (let i = 1; i <= TOTAL; i++) {
-        tiles[i].style.opacity = opacityFor(i);
+    // One smooth "toughness" value from 0 to 1 for every pixel.
+    function makeNoise(width, height, scale, octaves) {
+      const noise = new Float32Array(width * height);
+      let amplitude = 1;
+
+      for (let o = 0; o < octaves; o++) {
+        const gridSize = scale / Math.pow(2, o);        // each layer is finer
+        const gw = Math.ceil(width / gridSize) + 2;
+        const gh = Math.ceil(height / gridSize) + 2;
+        const grid = new Float32Array(gw * gh).map(function () {
+          return Math.random();                         // random value per grid point
+        });
+
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const gx = x / gridSize;
+            const gy = y / gridSize;
+            const x0 = Math.floor(gx);
+            const y0 = Math.floor(gy);
+            const tx = smooth(gx - x0);                 // how far between grid points
+            const ty = smooth(gy - y0);
+
+            const a = grid[y0 * gw + x0];               // the 4 surrounding points
+            const b = grid[y0 * gw + x0 + 1];
+            const c = grid[(y0 + 1) * gw + x0];
+            const d = grid[(y0 + 1) * gw + x0 + 1];
+
+            const top = a + (b - a) * tx;               // blend left-right
+            const bottom = c + (d - c) * tx;
+            noise[y * width + x] += (top + (bottom - top) * ty) * amplitude;
+          }
+        }
+        amplitude /= 2;                                 // finer layers count for less
       }
-      requestAnimationFrame(draw);
+
+      // Stretch so the values fill 0 to 1.
+      let min = Infinity;
+      let max = -Infinity;
+      for (let i = 0; i < noise.length; i++) {
+        if (noise[i] < min) min = noise[i];
+        if (noise[i] > max) max = noise[i];
+      }
+      for (let i = 0; i < noise.length; i++) {
+        noise[i] = (noise[i] - min) / (max - min);
+      }
+      return noise;
     }
-    draw();
+
+    // Noise values bunch up near the middle. This spreads them evenly across 0 to 1,
+    // so "damage 0.3" means roughly 30% of pixels chip.
+    function equalize(values) {
+      const BINS = 1024;
+      const counts = new Float32Array(BINS);
+      for (let i = 0; i < values.length; i++) {
+        counts[Math.min(BINS - 1, Math.floor(values[i] * BINS))]++;
+      }
+      const cdf = new Float32Array(BINS);               // running total: share of pixels at or below each bin
+      let running = 0;
+      for (let b = 0; b < BINS; b++) {
+        running += counts[b];
+        cdf[b] = running / values.length;
+      }
+      for (let i = 0; i < values.length; i++) {
+        values[i] = cdf[Math.min(BINS - 1, Math.floor(values[i] * BINS))];
+      }
+    }
+
+    const noise = makeNoise(WIDTH, HEIGHT, NOISE_SCALE, OCTAVES);
+    equalize(noise);
+
+    // Debug picture of the noise as grayscale (only used when DEBUG_NOISE is true).
+    const debugImage = ctx.createImageData(WIDTH, HEIGHT);
+    for (let i = 0; i < noise.length; i++) {
+      const v = noise[i] * 255;
+      debugImage.data[i * 4] = v;
+      debugImage.data[i * 4 + 1] = v;
+      debugImage.data[i * 4 + 2] = v;
+      debugImage.data[i * 4 + 3] = 255;
+    }
+
+    // ---------- Damage ----------
+    // 0 = intact, 1 = fully gone. Every square starts intact when the exhibition starts
+    // and slowly chips. Restoring a square resets it to 0, and it starts chipping again.
+    function damageFor(i) {
+      return damageForSquare(squares, startedAt, i);
+    }
+
+    // ---------- Flakes ----------
+    function spawnFlake(x, y, k) {
+      flakes.push({
+        x: x,
+        y: y,
+        vx: (Math.random() - 0.5) * 30,              // slight sideways drift
+        vy: -10 + Math.random() * 20,                // starts almost still, then gravity takes over
+        size: FLAKE_SIZE[0] + Math.random() * (FLAKE_SIZE[1] - FLAKE_SIZE[0]),
+        rot: Math.random() * Math.PI,
+        spin: (Math.random() - 0.5) * 4,             // how fast it tumbles
+        life: 0,
+        maxLife: 1.5 + Math.random() * 1.5,          // seconds before it's gone
+        color: "rgb(" + intactPixels[k] + "," + intactPixels[k + 1] + "," + intactPixels[k + 2] + ")"  // painted with the painting's own color
+      });
+    }
+
+    function drawFlakes(dt) {
+      for (let i = flakes.length - 1; i >= 0; i--) {
+        const f = flakes[i];
+        f.life += dt;
+        if (f.life >= f.maxLife || f.y > HEIGHT + 20) {
+          flakes.splice(i, 1);                       // done: remove it
+          continue;
+        }
+        f.vy += GRAVITY * dt;                        // gravity speeds it up
+        f.x += f.vx * dt;
+        f.y += f.vy * dt;
+        f.rot += f.spin * dt;
+
+        ctx.globalAlpha = Math.min(1, (f.maxLife - f.life) / (f.maxLife * 0.4));   // fade out near the end
+        ctx.fillStyle = f.color;
+        ctx.save();
+        ctx.translate(f.x, f.y);
+        ctx.rotate(f.rot);
+        ctx.fillRect(-f.size / 2, -f.size / 3, f.size, f.size * 0.66);
+        ctx.restore();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // ---------- Drawing the wall ----------
+    let primed = false;   // stays false during the first redraw, so reloading the page doesn't cause a burst of flakes
+
+    function redrawWall() {
+      for (let sq = 1; sq <= TOTAL; sq++) {
+        const damage = damageFor(sq);
+        if (damage === lastDamage[sq]) continue;   // nothing changed here since the last redraw
+        lastDamage[sq] = damage;
+        const x0 = ((sq - 1) % COLS) * CELL;
+        const y0 = Math.floor((sq - 1) / COLS) * CELL;
+
+        for (let y = y0; y < y0 + CELL; y++) {
+          for (let x = x0; x < x0 + CELL; x++) {
+            const p = y * WIDTH + x;     // this pixel's position in the noise list
+            const k = p * 4;             // its position in the color list (4 numbers each)
+
+            // How far this pixel has chipped: 0 = intact, 1 = fully chipped.
+            // Weaker pixels (low noise) go first, and EDGE_BAND makes the change gradual.
+            const t = Math.min(1, Math.max(0, (damage - noise[p]) / EDGE_BAND));
+
+            if (t === 0) {               // intact: copy the painting's pixel
+              fallen[p] = 0;             // (a restored pixel can chip and shed again)
+              out[k] = intactPixels[k];
+              out[k + 1] = intactPixels[k + 1];
+              out[k + 2] = intactPixels[k + 2];
+              out[k + 3] = intactPixels[k + 3];
+            } else {                     // chipped, or partway: mix painting and chip color
+              out[k] = intactPixels[k] + (CHIP_COLOR[0] - intactPixels[k]) * t;
+              out[k + 1] = intactPixels[k + 1] + (CHIP_COLOR[1] - intactPixels[k + 1]) * t;
+              out[k + 2] = intactPixels[k + 2] + (CHIP_COLOR[2] - intactPixels[k + 2]) * t;
+              out[k + 3] = 255;
+
+              // Just chipped for the first time? Maybe throw off a flake.
+              if (t >= 0.5 && fallen[p] === 0) {
+                fallen[p] = 1;
+                if (primed && intactPixels[k + 3] > 0 && flakes.length < MAX_FLAKES && Math.random() < FLAKE_CHANCE) {
+                  spawnFlake(x, y, k);
+                }
+              }
+            }
+          }
+        }
+      }
+      baseCtx.putImageData(output, 0, 0);
+      primed = true;
+    }
+
+    // // ---------- Corner readout (for testing) ----------
+    // function drawHud() {
+    //   const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+    //   ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+    //   ctx.fillRect(10, 10, 560, 130);
+    //   ctx.fillStyle = "#fff";
+    //   ctx.font = "30px monospace";
+    //   ctx.fillText("seconds since start: " + seconds, 24, 52);
+    //   ctx.fillText("square 1 damage: " + damageFor(1).toFixed(3), 24, 92);
+    //   ctx.fillText("flakes falling: " + flakes.length, 24, 128);
+    // }
+
+    // ---------- Animation loop ----------
+    let lastRedraw = -Infinity;
+    let lastFrame = 0;
+
+    function draw(now) {
+      requestAnimationFrame(draw);
+      const dt = Math.min(0.05, (now - lastFrame) / 1000);   // seconds since last frame (capped)
+      lastFrame = now;
+
+      if (DEBUG_NOISE) {
+        ctx.putImageData(debugImage, 0, 0);
+        return;
+      }
+
+      if (now - lastRedraw >= REDRAW_MS) {   // the wall itself only needs a few redraws per second
+        lastRedraw = now;
+        redrawWall();
+      }
+
+      ctx.drawImage(base, 0, 0);        // put the wall on screen...
+      drawFlakes(dt);                   // ...then the falling flakes on top
+      if (DEBUG_HUD) drawHud();
+    }
+
+    requestAnimationFrame(draw);
   </script>
 </body>
 </html>
